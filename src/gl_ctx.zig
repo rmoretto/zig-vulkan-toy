@@ -40,6 +40,14 @@ const QueueFamilies = struct {
     pub fn sameQueue(self: *const QueueFamilies) bool {
         return self.graphics_family == self.presentation_family;
     }
+
+    pub fn asSlice(self: *const QueueFamilies) ?[2]u32 {
+        if (!self.complete()) {
+            return null;
+        }
+
+        return [_]u32{self.graphics_family.?, self.presentation_family.?};
+    }
 };
 
 fn makeLayerName(name: []const u8) [vk.MAX_EXTENSION_NAME_SIZE]u8 {
@@ -108,8 +116,16 @@ pub const GraphicalContext = struct {
     vkb: vk.BaseWrapper,
 
     instance: vk.InstanceProxy,
+    physical_device: vk.PhysicalDevice,
     device: vk.DeviceProxy,
     surface: vk.SurfaceKHR,
+
+    swapchain: vk.SwapchainKHR,
+    swapchain_format: vk.SurfaceFormatKHR,
+    swapchain_extent: vk.Extent2D,
+
+    images: []vk.Image,
+    images_view: std.ArrayList(vk.ImageView),
 
     debug_messenger_ext: ?vk.DebugUtilsMessengerEXT,
 
@@ -123,6 +139,7 @@ pub const GraphicalContext = struct {
         try self.setupDebugMessenger();
         try self.initSurface(window);
         try self.initDevice();
+        try self.initSwapchain(window);
 
         return self;
     }
@@ -208,6 +225,117 @@ pub const GraphicalContext = struct {
         vkd.* = vk.DeviceWrapper.load(device, self.instance.wrapper.dispatch.vkGetDeviceProcAddr.?);
         self.device = vk.DeviceProxy.init(device, vkd);
         errdefer self.device.destroyDevice(null);
+        self.physical_device = suitable_device;
+    }
+
+    fn initSwapchain(self: *GraphicalContext, window: *glfw.Window) !void {
+        const formats = try self.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(self.physical_device, self.surface, self.allocator);
+        defer self.allocator.free(formats);
+        
+        var cur_format: ?vk.SurfaceFormatKHR = null;
+        for (formats) |format| {
+            const has_preferred_format = format.format == .b8g8r8_srgb;
+            const has_preferred_color_space = format.color_space == .srgb_nonlinear_khr;
+
+            if (has_preferred_format and has_preferred_color_space) {
+                cur_format = format;
+            }
+        }
+
+        if (cur_format == null) {
+            cur_format = formats[0];
+        }
+
+        const present_modes = try self.instance.getPhysicalDeviceSurfacePresentModesAllocKHR(self.physical_device, self.surface, self.allocator);
+        defer self.allocator.free(present_modes);
+
+        var cur_present_mode: ?vk.PresentModeKHR = null;
+        for (present_modes) |present_mode| {
+            const has_preferred_mode = present_mode == .mailbox_khr;
+            if (has_preferred_mode) {
+                cur_present_mode = present_mode;
+            }
+        }
+
+        if (cur_present_mode == null) {
+            cur_present_mode = .immediate_khr;
+        }
+
+        const capabilities = try self.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(self.physical_device, self.surface);
+
+        var cur_extent: vk.Extent2D = undefined;
+        if (capabilities.current_extent.width != std.math.maxInt(u32)) {
+            cur_extent = capabilities.current_extent;
+        } else {
+            var width: u32 = undefined;
+            var height: u32 = undefined;
+            glfw.getFramebufferSize(window, &width, &height);
+            
+            width = std.math.clamp(width, capabilities.min_image_extent.width, capabilities.max_image_extent.width);
+            height = std.math.clamp(width, capabilities.min_image_extent.height, capabilities.max_image_extent.height);
+
+            cur_extent = .{
+                .width = width,
+                .height = height,
+            };
+        }
+
+        var image_count: u32 = capabilities.min_image_count + 1;
+        if (capabilities.max_image_count > 0) {
+            image_count = @max(image_count, capabilities.max_image_count);
+        }
+
+        const queue_family = try self.getQueueFamilies(self.physical_device);
+        const queue_slice = queue_family.asSlice().?;
+        
+        self.swapchain = try self.device.createSwapchainKHR(&.{
+            .surface = self.surface,
+            .min_image_count = image_count,
+            .image_format = cur_format.?.format,
+            .image_color_space = cur_format.?.color_space,
+            .image_extent = cur_extent,
+            .image_array_layers = 1,
+            .image_usage = .{ .color_attachment_bit = true, .transfer_dst_bit = true },
+            .image_sharing_mode = if (queue_family.sameQueue()) .exclusive else .concurrent,
+            .queue_family_index_count = if (queue_family.sameQueue()) 0 else 2,
+            .p_queue_family_indices = if (queue_family.sameQueue()) null else &queue_slice,
+            .pre_transform = capabilities.current_transform,
+            .composite_alpha = .{ .opaque_bit_khr = true },
+            .present_mode = cur_present_mode.?,
+            .clipped = vk.TRUE
+        }, null);
+        errdefer self.device.destroySwapchainKHR(self.swapchain, null);
+
+        self.swapchain_format = cur_format.?;
+        self.swapchain_extent = cur_extent;
+
+        self.images = try self.device.getSwapchainImagesAllocKHR(self.swapchain, self.allocator);
+        errdefer self.allocator.free(self.images);
+
+        self.images_view = std.ArrayList(vk.ImageView).init(self.allocator);
+        for (self.images) |image| {
+            const image_view = try self.device.createImageView(&.{
+                .image = image,
+                .view_type = .@"2d",
+                .format = self.swapchain_format.format,
+                .components = .{
+                    .r = .identity,
+                    .g = .identity,
+                    .b = .identity,
+                    .a = .identity,
+                },
+                .subresource_range = .{
+                    .aspect_mask = .{ .color_bit = true },
+                    .base_mip_level = 0,
+                    .level_count = 1,
+                    .base_array_layer = 0,
+                    .layer_count = 1,
+                }
+            }, null);
+            errdefer self.device.destroyImageView(image_view, null);
+
+            try self.images_view.append(image_view);
+        }
     }
 
     fn getSuitableDevice(self: *GraphicalContext) !?vk.PhysicalDevice {
@@ -230,16 +358,24 @@ pub const GraphicalContext = struct {
                 }
             }
 
+            const formats = try self.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(device, self.surface, self.allocator);
+            defer self.allocator.free(formats);
+
+            const present_modes = try self.instance.getPhysicalDeviceSurfacePresentModesAllocKHR(device, self.surface, self.allocator);
+            defer self.allocator.free(present_modes);
+
             const has_required_extensions = required_device_extensions.len == extensions_count;
             const is_discrete = prop.device_type == vk.PhysicalDeviceType.discrete_gpu;
             const has_geometry_shader = feats.geometry_shader == vk.TRUE;
+            const is_swapchain_adequate = formats.len != 0 and present_modes.len != 0;
 
             try self.log(.INFO, .GENERAL, "Checking if device {s} is suitable:", .{prop.device_name});
             try self.log(.INFO, .GENERAL, "    Is Discrete: {any}", .{is_discrete});
             try self.log(.INFO, .GENERAL, "    Has Required Extensions: {any}", .{has_required_extensions});
             try self.log(.INFO, .GENERAL, "    Has Geometry Shader: {any}", .{has_geometry_shader});
+            try self.log(.INFO, .GENERAL, "    Is SwapChain Adequate: {any}", .{is_swapchain_adequate});
 
-            if (has_required_extensions and is_discrete and has_geometry_shader) {
+            if (has_required_extensions and is_discrete and has_geometry_shader and is_swapchain_adequate) {
                 try self.log(.INFO, .GENERAL, "Found suitable device: {s}", .{prop.device_name});
                 return device;
             }
@@ -325,6 +461,17 @@ pub const GraphicalContext = struct {
             self.instance.destroyDebugUtilsMessengerEXT(debug_ext, null);
         }
 
+        const image_view_slice: []vk.ImageView = self.images_view.allocatedSlice();
+        for (image_view_slice) |image_view| {
+            std.debug.print("destroying image view\n", .{});
+            self.device.destroyImageView(image_view, null);
+        }
+
+        self.images_view.deinit();
+        self.allocator.free(self.images);
+
+        self.device.destroySwapchainKHR(self.swapchain, null);
+        self.instance.destroySurfaceKHR(self.surface, null);
         self.device.destroyDevice(null);
         self.instance.destroyInstance(null);
     }

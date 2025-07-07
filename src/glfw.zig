@@ -171,3 +171,14 @@ pub fn createWindow(width: c_int, height: c_int, title: [*:0]const u8, monitor: 
 pub fn windowShouldClose(window: *Window) bool {
     return glfw_c.glfwWindowShouldClose(window) == 1;
 }
+
+
+pub fn getFramebufferSize(window: *Window, width: *u32, height: *u32) void {
+    var glfw_width: c_int = undefined;
+    var glfw_height: c_int = undefined;
+    glfw_c.glfwGetFramebufferSize(window, &glfw_width, &glfw_height);
+
+    width.* = @intCast(glfw_width);
+    height.* = @intCast(glfw_height);
+}
+
