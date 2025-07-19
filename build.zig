@@ -22,6 +22,15 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("glfw");
     exe.root_module.addImport("vulkan", vulkan);
 
+    const install = b.getInstallStep();
+    const install_shaders = b.addInstallDirectory(.{
+        .source_dir = .{ .src_path = .{ .owner = b, .sub_path = "src/assets/shaders" }},
+        .install_dir = .{ .prefix = {} },
+        .install_subdir = "assets/shaders"
+    });
+
+    install.dependOn(&install_shaders.step);
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -36,7 +45,7 @@ pub fn build(b: *std.Build) void {
     // installation directory rather than directly from within the cache directory.
     // This is not necessary, however, if the application depends on other installed
     // files, this ensures they will be present and in the expected location.
-    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.step.dependOn(install);
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`

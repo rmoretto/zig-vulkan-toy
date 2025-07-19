@@ -29,6 +29,8 @@
             vulkan-tools
             vulkan-tools-lunarg
             vulkan-validation-layers
+            shader-slang
+            shaderc
           ];
 
           LD_LIBRARY_PATH="${glfw}/lib:${freetype}/lib:${vulkan-loader}/lib:${vulkan-validation-layers}/lib";

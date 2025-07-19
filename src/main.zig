@@ -1,6 +1,6 @@
 const std = @import("std");
-const glfw = @import("glfw.zig");
-const gl_ctx = @import("gl_ctx.zig");
+const glfw = @import("gl/glfw.zig");
+const gl_ctx = @import("gl/ctx.zig");
 
 fn getGlfwVersion() void {
     var major: i32 = 0;
@@ -10,7 +10,6 @@ fn getGlfwVersion() void {
     glfw.getVersion(&major, &minor, &rev);
     std.debug.print("GLFW {}.{}.{}\n", .{ major, minor, rev });
 }
-
 
 pub fn main() !void {
     getGlfwVersion();
@@ -34,12 +33,13 @@ pub fn main() !void {
     var ctx = try gl_ctx.GraphicalContext.init(allocator, window);
     defer ctx.deinit();
 
-    // while (!glfw.windowShouldClose(window)) {
-    //     if (glfw.getKey(window, glfw.KeyEscape) == glfw.Press) {
-    //         glfw.setWindowShouldClose(window, 1);
-    //     }
-    //
-    //     glfw.pollEvents();
-    // }
+    while (!glfw.windowShouldClose(window)) {
+        if (glfw.getKey(window, glfw.KeyEscape) == glfw.Press) {
+            glfw.setWindowShouldClose(window, 1);
+        }
+
+        try ctx.drawFrame();
+        glfw.pollEvents();
+    }
 }
 
