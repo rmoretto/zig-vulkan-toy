@@ -22,9 +22,8 @@ pub fn main() !void {
     try glfw.init();
     defer glfw.terminate();
 
-
     glfw.windowHint(glfw.ClientApi, glfw.NoApi);
-    glfw.windowHint(glfw.Resizable, 0);
+    glfw.windowHint(glfw.Resizable, glfw.True);
     glfw.initHint(glfw.Resizable, glfw.True);
 
     const window: *glfw.Window = try glfw.createWindow(800, 640, "Hello", null, null);
@@ -40,6 +39,7 @@ pub fn main() !void {
         }
 
         try ctx.drawFrame();
+
         glfw.pollEvents();
     }
 

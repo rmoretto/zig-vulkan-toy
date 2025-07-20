@@ -144,14 +144,8 @@ pub const GraphicalContext = struct {
     command_pool: vk.CommandPool,
 
     current_frame: u32 = 0,
-    max_frames_in_flight: u32 = 3,
+    image_count: u32,
     frame_command_buffers: std.ArrayList(FrameCommandBuffer),
-
-    // command_buffer: vk.CommandBuffer,
-    //
-    // image_available_semaphore: vk.Semaphore,
-    // render_finished_semaphore: vk.Semaphore,
-    // in_flight_fence: vk.Fence,
 
     images: []vk.Image,
     images_view: std.ArrayList(vk.ImageView),
@@ -162,17 +156,20 @@ pub const GraphicalContext = struct {
 
     debug_messenger_ext: ?vk.DebugUtilsMessengerEXT,
 
+    window: *glfw.Window,
+
     pub fn init(allocator: Allocator, window: *glfw.Window) !GraphicalContext {
         var self: GraphicalContext = undefined;
 
         self.allocator = allocator;
         self.vkb = vk.BaseWrapper.load(glfw.getInstanceProcAddress);
+        self.window = window;
 
         try self.initInstance();
         try self.setupDebugMessenger();
-        try self.initSurface(window);
+        try self.initSurface();
         try self.initDevice();
-        try self.initSwapchain(window);
+        try self.initSwapchain();
         try self.initRenderPass();
         try self.initGraphicsPipeline();
         try self.initFramebuffer();
@@ -215,9 +212,9 @@ pub const GraphicalContext = struct {
         errdefer self.instance.destroyInstance(null);
     }
 
-    fn initSurface(self: *GraphicalContext, window: *glfw.Window) !void {
+    fn initSurface(self: *GraphicalContext) !void {
         var surface: vk.SurfaceKHR = undefined;
-        if (glfw.createWindowSurface(self.instance.handle, window, null, &surface) != .success) {
+        if (glfw.createWindowSurface(self.instance.handle, self.window, null, &surface) != .success) {
             return error.ErrorCreatingSurface;
         }
 
@@ -269,7 +266,7 @@ pub const GraphicalContext = struct {
         self.present_queue = self.device.getDeviceQueue(queue_family.presentation_family.?, 0);
     }
 
-    fn initSwapchain(self: *GraphicalContext, window: *glfw.Window) !void {
+    fn initSwapchain(self: *GraphicalContext) !void {
         const formats = try self.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(self.physical_device, self.surface, self.allocator);
         defer self.allocator.free(formats);
         
@@ -310,7 +307,7 @@ pub const GraphicalContext = struct {
         } else {
             var width: u32 = undefined;
             var height: u32 = undefined;
-            glfw.getFramebufferSize(window, &width, &height);
+            glfw.getFramebufferSize(self.window, &width, &height);
             
             width = std.math.clamp(width, capabilities.min_image_extent.width, capabilities.max_image_extent.width);
             height = std.math.clamp(width, capabilities.min_image_extent.height, capabilities.max_image_extent.height);
@@ -326,6 +323,7 @@ pub const GraphicalContext = struct {
             image_count = @max(image_count, capabilities.max_image_count);
         }
 
+        self.image_count = image_count;
         const queue_family = try self.getQueueFamilies(self.physical_device);
         const queue_slice = queue_family.asSlice().?;
         
@@ -584,20 +582,18 @@ pub const GraphicalContext = struct {
 
     fn initCommandBuffer(self: *GraphicalContext) !void {
         self.current_frame = 0;
-        self.max_frames_in_flight = 3;
         const alloc_info = vk.CommandBufferAllocateInfo{
             .command_pool = self.command_pool,
             .level = .primary,
-            .command_buffer_count = self.max_frames_in_flight,
+            .command_buffer_count = self.image_count,
         };
 
-        var buffers: [*]vk.CommandBuffer = undefined;
-        try self.device.allocateCommandBuffers(&alloc_info, @ptrCast(&buffers));
-        print("hello\n", .{});
-        self.frame_command_buffers = std.ArrayList(FrameCommandBuffer).init(self.allocator);
-        for (buffers[0..self.max_frames_in_flight]) |cmd_buffer| {
-            print("hello {?}\n", .{ cmd_buffer });
+        const buffers = try self.allocator.alloc(vk.CommandBuffer, self.image_count);
+        defer self.allocator.free(buffers);
+        try self.device.allocateCommandBuffers(&alloc_info, buffers.ptr);
 
+        self.frame_command_buffers = std.ArrayList(FrameCommandBuffer).init(self.allocator);
+        for (buffers) |cmd_buffer| {
             const img, const render, const fence = try self.initSyncObjects();
             try self.frame_command_buffers.append(.{
                 .command_buffer = cmd_buffer,
@@ -620,6 +616,25 @@ pub const GraphicalContext = struct {
             try self.device.createSemaphore(&semaphore_info, null),
             try self.device.createFence(&fence_info, null),
         };
+    }
+
+    fn recreateSwapchain(self: *GraphicalContext) !void {
+        print("recreating swapchin............\n", .{});
+        try self.device.deviceWaitIdle();
+
+        for (self.swapchain_framebuffers.items) |framebuffer| {
+            self.device.destroyFramebuffer(framebuffer, null);
+        }
+        self.swapchain_framebuffers.clearAndFree();
+
+        for (self.images_view.items) |image_view| {
+            self.device.destroyImageView(image_view, null);
+        }
+        self.images_view.clearAndFree();
+
+        self.device.destroySwapchainKHR(self.swapchain, null);
+
+        try self.initSwapchain();
     }
 
     fn recordCommandBuffer(self: *GraphicalContext, command_bufer: vk.CommandBuffer, image_index: u32) !void {
@@ -665,35 +680,47 @@ pub const GraphicalContext = struct {
     pub fn drawFrame(self: *GraphicalContext) !void {
         const cur_frame_command_buffer = self.frame_command_buffers.items[self.current_frame];
 
-        _ = try self.device.waitForFences(1, @ptrCast(&cur_frame_command_buffer.in_flight_fence), vk.TRUE, std.math.maxInt(u32));
-        try self.device.resetFences(1, @ptrCast(&cur_frame_command_buffer.in_flight_fence));
+        const command_buffer = cur_frame_command_buffer.command_buffer;
+        const in_flight_fence = cur_frame_command_buffer.in_flight_fence; 
+        const image_available_semaphore = cur_frame_command_buffer.image_available_semaphore;
+        const render_finished_semaphore = cur_frame_command_buffer.render_finished_semaphore;
+
+        _ = try self.device.waitForFences(1, @ptrCast(&in_flight_fence), vk.TRUE, std.math.maxInt(u32));
+        try self.device.resetFences(1, @ptrCast(&in_flight_fence));
             
         const acquire_res = try self.device.acquireNextImageKHR(
-            self.swapchain, std.math.maxInt(u32), cur_frame_command_buffer.image_available_semaphore, .null_handle
+            self.swapchain, std.math.maxInt(u32), image_available_semaphore, .null_handle
         );
 
-        try self.device.resetCommandBuffer(cur_frame_command_buffer.command_buffer, .{});
-        try self.recordCommandBuffer(cur_frame_command_buffer.command_buffer, acquire_res.image_index);
+        if (acquire_res.result == .error_out_of_date_khr) {
+            try self.recreateSwapchain();
+            return;
+        } else if (acquire_res.result != .success and acquire_res.result != .suboptimal_khr) {
+            return error.FailedToAcquireSwapchain;
+        }
+
+        try self.device.resetCommandBuffer(command_buffer, .{});
+        try self.recordCommandBuffer(command_buffer, acquire_res.image_index);
         
         try self.device.queueSubmit(self.graphics_queue, 1, &[_]vk.SubmitInfo{.{
             .command_buffer_count = 1,
-            .p_command_buffers = @ptrCast(&cur_frame_command_buffer.command_buffer),
+            .p_command_buffers = @ptrCast(&command_buffer),
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast(&cur_frame_command_buffer.image_available_semaphore),
+            .p_wait_semaphores = @ptrCast(&image_available_semaphore),
             .signal_semaphore_count = 1,
-            .p_signal_semaphores = @ptrCast(&cur_frame_command_buffer.render_finished_semaphore),
+            .p_signal_semaphores = @ptrCast(&render_finished_semaphore),
             .p_wait_dst_stage_mask = &[_]vk.PipelineStageFlags{.{.color_attachment_output_bit = true}},
-        }}, cur_frame_command_buffer.in_flight_fence);
+        }}, in_flight_fence);
 
         _ = try self.device.queuePresentKHR(self.present_queue, &.{
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast(&cur_frame_command_buffer.render_finished_semaphore),
+            .p_wait_semaphores = @ptrCast(&render_finished_semaphore),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast(&self.swapchain),
             .p_image_indices = @ptrCast(&acquire_res.image_index)
         });
 
-        self.current_frame = (self.current_frame + 1) % self.max_frames_in_flight;
+        self.current_frame = @rem((self.current_frame + 1), self.image_count);
     }
 
     pub fn deviceWaitIdle(self: *GraphicalContext) !void {
