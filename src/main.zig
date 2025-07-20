@@ -36,10 +36,13 @@ pub fn main() !void {
     while (!glfw.windowShouldClose(window)) {
         if (glfw.getKey(window, glfw.KeyEscape) == glfw.Press) {
             glfw.setWindowShouldClose(window, 1);
+            continue;
         }
 
         try ctx.drawFrame();
         glfw.pollEvents();
     }
+
+    try ctx.deviceWaitIdle();
 }
 
