@@ -8,7 +8,7 @@ const vk = @import("vulkan");
 pub const ClientApi = glfw_c.GLFW_CLIENT_API;
 pub const NoApi = glfw_c.GLFW_NO_API;
 pub const True = glfw_c.GLFW_TRUE;
-pub const False = glfw_c.GLFW_False;
+pub const False = glfw_c.GLFW_FALSE;
 pub const Resizable = glfw_c.GLFW_RESIZABLE;
 
 pub const Window = glfw_c.GLFWwindow;
@@ -23,6 +23,10 @@ pub const setWindowShouldClose = glfw_c.glfwSetWindowShouldClose;
 pub const terminate = glfw_c.glfwTerminate;
 pub const windowHint = glfw_c.glfwWindowHint;
 pub const getRequiredInstanceExtension = glfw_c.glfwGetRequiredInstanceExtensions;
+
+pub const getWindowUserPointer = glfw_c.glfwGetWindowUserPointer;
+pub const setWindowUserPointer = glfw_c.glfwSetWindowUserPointer;
+pub const setFramebufferSizeCallback = glfw_c.glfwSetWindowSizeCallback;
 
 extern fn glfwGetInstanceProcAddress(instance: vk.Instance, procname: [*:0]const u8) vk.PfnVoidFunction;
 extern fn glfwGetPhysicalDevicePresentationSupport(instance: vk.Instance, pdev: vk.PhysicalDevice, queuefamily: u32) c_int;

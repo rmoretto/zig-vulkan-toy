@@ -56,13 +56,6 @@ const QueueFamilies = struct {
     }
 };
 
-const FrameCommandBuffer = struct {
-    command_buffer: vk.CommandBuffer,
-    image_available_semaphore: vk.Semaphore,
-    render_finished_semaphore: vk.Semaphore,
-    in_flight_fence: vk.Fence
-};
-
 fn makeLayerName(name: []const u8) [vk.MAX_EXTENSION_NAME_SIZE]u8 {
     var result: [vk.MAX_EXTENSION_NAME_SIZE]u8 = undefined;
     @memcpy(result[0..name.len], name);
@@ -123,6 +116,93 @@ fn initDebugCreateInfo() vk.DebugUtilsMessengerCreateInfoEXT {
     };
 }
 
+fn resizeCb(window: ?*glfw.Window, _: c_int, _: c_int) callconv(.c) void {
+    const ctx: *GraphicalContext = @ptrCast(@alignCast(glfw.getWindowUserPointer(window)));
+    ctx.framebuffer_resized = true;
+}
+
+const SwapImage = struct {
+    image: vk.Image,
+    image_view: vk.ImageView,
+
+    framebuffer: vk.Framebuffer,
+    command_buffer: vk.CommandBuffer,
+
+    image_available_semaphore: vk.Semaphore,
+    render_finished_semaphore: vk.Semaphore,
+    in_flight_fence: vk.Fence,
+
+    pub fn init(ctx: *GraphicalContext, image: vk.Image) !SwapImage {
+        var self: SwapImage = undefined;
+
+        self.image = image;
+
+        self.image_view = try ctx.device.createImageView(&.{
+            .image = self.image,
+            .view_type = .@"2d",
+            .format = ctx.swapchain_format.format,
+            .components = .{
+                .r = .identity,
+                .g = .identity,
+                .b = .identity,
+                .a = .identity,
+            },
+            .subresource_range = .{
+                .aspect_mask = .{ .color_bit = true },
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            }
+        }, null);
+        errdefer ctx.device.destroyImageView(self.image_view, null);
+
+        const attachments = [_]vk.ImageView{ self.image_view };
+        self.framebuffer = try ctx.device.createFramebuffer(&.{
+            .render_pass = ctx.render_pass,
+            .attachment_count = 1,
+            .p_attachments = &attachments,
+            .width = ctx.swapchain_extent.width,
+            .height = ctx.swapchain_extent.height,
+            .layers = 1
+        }, null);
+        errdefer ctx.device.destroyFramebuffer(self.framebuffer, null);
+
+        const semaphore_info = vk.SemaphoreCreateInfo{};
+        const fence_info = vk.FenceCreateInfo{
+            .flags = .{ .signaled_bit = true }
+        };
+
+        self.image_available_semaphore = try ctx.device.createSemaphore(&semaphore_info, null);
+        self.render_finished_semaphore = try ctx.device.createSemaphore(&semaphore_info, null);
+        self.in_flight_fence = try ctx.device.createFence(&fence_info, null);
+
+        errdefer {
+            ctx.device.destroySemaphore(self.image_available_semaphore, null);
+            ctx.device.destroySemaphore(self.render_finished_semaphore, null);
+            ctx.device.destroyFence(self.in_flight_fence, null);
+        }
+
+        const cmd_alloc_info = vk.CommandBufferAllocateInfo{
+            .command_pool = ctx.command_pool,
+            .level = .primary,
+            .command_buffer_count = 1,
+        };
+        try ctx.device.allocateCommandBuffers(&cmd_alloc_info, @ptrCast(&self.command_buffer));
+
+        return self;
+    }
+
+    pub fn deinit(self: *const SwapImage, ctx: *GraphicalContext) void {
+        ctx.device.destroySemaphore(self.image_available_semaphore, null);
+        ctx.device.destroySemaphore(self.render_finished_semaphore, null);
+        ctx.device.destroyFence(self.in_flight_fence, null);
+
+        ctx.device.destroyFramebuffer(self.framebuffer, null);
+        ctx.device.destroyImageView(self.image_view, null);
+    }
+};
+
 pub const GraphicalContext = struct {
     allocator: Allocator,
 
@@ -140,15 +220,19 @@ pub const GraphicalContext = struct {
     swapchain_format: vk.SurfaceFormatKHR,
     swapchain_extent: vk.Extent2D,
 
-    swapchain_framebuffers: std.ArrayList(vk.Framebuffer),
+    swap_images: []SwapImage,
+
     command_pool: vk.CommandPool,
 
     current_frame: u32 = 0,
+    max_in_flight_frame: u32 = 1,
+    framebuffer_resized: bool = false,
     image_count: u32,
-    frame_command_buffers: std.ArrayList(FrameCommandBuffer),
 
-    images: []vk.Image,
-    images_view: std.ArrayList(vk.ImageView),
+    // frame_command_buffers: std.ArrayList(FrameCommandBuffer),
+    // images: []vk.Image,
+    // images_view: std.ArrayList(vk.ImageView),
+    // swapchain_framebuffers: std.ArrayList(vk.Framebuffer),
 
     render_pass: vk.RenderPass,
     pipeline_layout: vk.PipelineLayout,
@@ -165,16 +249,21 @@ pub const GraphicalContext = struct {
         self.vkb = vk.BaseWrapper.load(glfw.getInstanceProcAddress);
         self.window = window;
 
+        glfw.setWindowUserPointer(self.window, &self);
+        _ = glfw.setFramebufferSizeCallback(self.window, resizeCb);
+
         try self.initInstance();
         try self.setupDebugMessenger();
         try self.initSurface();
         try self.initDevice();
+        try self.initCommandPool();
         try self.initSwapchain();
         try self.initRenderPass();
         try self.initGraphicsPipeline();
-        try self.initFramebuffer();
-        try self.initCommandPool();
-        try self.initCommandBuffer();
+        try self.initSwapImages();
+
+        // try self.initFramebuffer();
+        // try self.initCommandBuffer();
 
         return self;
     }
@@ -308,7 +397,7 @@ pub const GraphicalContext = struct {
             var width: u32 = undefined;
             var height: u32 = undefined;
             glfw.getFramebufferSize(self.window, &width, &height);
-            
+
             width = std.math.clamp(width, capabilities.min_image_extent.width, capabilities.max_image_extent.width);
             height = std.math.clamp(width, capabilities.min_image_extent.height, capabilities.max_image_extent.height);
 
@@ -326,7 +415,7 @@ pub const GraphicalContext = struct {
         self.image_count = image_count;
         const queue_family = try self.getQueueFamilies(self.physical_device);
         const queue_slice = queue_family.asSlice().?;
-        
+
         self.swapchain = try self.device.createSwapchainKHR(&.{
             .surface = self.surface,
             .min_image_count = image_count,
@@ -347,34 +436,6 @@ pub const GraphicalContext = struct {
 
         self.swapchain_format = cur_format.?;
         self.swapchain_extent = cur_extent;
-
-        self.images = try self.device.getSwapchainImagesAllocKHR(self.swapchain, self.allocator);
-        errdefer self.allocator.free(self.images);
-
-        self.images_view = std.ArrayList(vk.ImageView).init(self.allocator);
-        for (self.images) |image| {
-            const image_view = try self.device.createImageView(&.{
-                .image = image,
-                .view_type = .@"2d",
-                .format = self.swapchain_format.format,
-                .components = .{
-                    .r = .identity,
-                    .g = .identity,
-                    .b = .identity,
-                    .a = .identity,
-                },
-                .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
-                    .base_mip_level = 0,
-                    .level_count = 1,
-                    .base_array_layer = 0,
-                    .layer_count = 1,
-                }
-            }, null);
-            errdefer self.device.destroyImageView(image_view, null);
-
-            try self.images_view.append(image_view);
-        }
     }
 
     fn initRenderPass(self: *GraphicalContext) !void {
@@ -417,6 +478,24 @@ pub const GraphicalContext = struct {
             .dependency_count = 1,
             .p_dependencies = @ptrCast(&dependency)
         }, null);
+    }
+
+    fn initSwapImages(self: *GraphicalContext) !void {
+        const images = try self.device.getSwapchainImagesAllocKHR(self.swapchain, self.allocator);
+        errdefer self.allocator.free(images);
+
+        var swap_images = try self.allocator.alloc(SwapImage, images.len);
+        errdefer self.allocator.free(swap_images);
+
+        for (swap_images.ptr[0..images.len], 0..) |*swap_image, i| {
+            const s = try SwapImage.init(self, images[i]);
+            swap_image.* = s;
+        }
+
+        self.swap_images = swap_images;
+
+        self.current_frame = 0;
+        self.max_in_flight_frame = @intCast(images.len);
     }
 
     fn initGraphicsPipeline(self: *GraphicalContext) !void {
@@ -547,24 +626,24 @@ pub const GraphicalContext = struct {
         );
     }
 
-    fn initFramebuffer(self: *GraphicalContext) !void {
-        self.swapchain_framebuffers = std.ArrayList(vk.Framebuffer).init(self.allocator);
-
-        for (self.images_view.items) |image_view| {
-            const attachments = [_]vk.ImageView{ image_view };
-
-            const framebuffer = try self.device.createFramebuffer(&.{
-                .render_pass = self.render_pass,
-                .attachment_count = 1,
-                .p_attachments = &attachments,
-                .width = self.swapchain_extent.width,
-                .height = self.swapchain_extent.height,
-                .layers = 1
-            }, null);
-
-            try self.swapchain_framebuffers.append(framebuffer);
-        }
-    }
+    // fn initFramebuffer(self: *GraphicalContext) !void {
+    //     self.swapchain_framebuffers = std.ArrayList(vk.Framebuffer).init(self.allocator);
+    //
+    //     for (self.images_view.items) |image_view| {
+    //         const attachments = [_]vk.ImageView{ image_view };
+    //
+    //         const framebuffer = try self.device.createFramebuffer(&.{
+    //             .render_pass = self.render_pass,
+    //             .attachment_count = 1,
+    //             .p_attachments = &attachments,
+    //             .width = self.swapchain_extent.width,
+    //             .height = self.swapchain_extent.height,
+    //             .layers = 1
+    //         }, null);
+    //
+    //         try self.swapchain_framebuffers.append(framebuffer);
+    //     }
+    // }
 
     fn initCommandPool(self: *GraphicalContext) !void {
         const queue_families = try self.getQueueFamilies(self.physical_device);
@@ -580,69 +659,69 @@ pub const GraphicalContext = struct {
         self.command_pool = try self.device.createCommandPool(&pool_info, null);
     }
 
-    fn initCommandBuffer(self: *GraphicalContext) !void {
-        self.current_frame = 0;
-        const alloc_info = vk.CommandBufferAllocateInfo{
-            .command_pool = self.command_pool,
-            .level = .primary,
-            .command_buffer_count = self.image_count,
-        };
+    // fn initCommandBuffer(self: *GraphicalContext) !void {
+    //     self.current_frame = 0;
+    //     self.max_in_flight_frame = 2;
+    //     const alloc_info = vk.CommandBufferAllocateInfo{
+    //         .command_pool = self.command_pool,
+    //         .level = .primary,
+    //         .command_buffer_count = self.max_in_flight_frame,
+    //     };
+    //
+    //     const buffers = try self.allocator.alloc(vk.CommandBuffer, self.max_in_flight_frame);
+    //     defer self.allocator.free(buffers);
+    //     try self.device.allocateCommandBuffers(&alloc_info, buffers.ptr);
+    //
+    //     self.frame_command_buffers = std.ArrayList(FrameCommandBuffer).init(self.allocator);
+    //     for (buffers) |cmd_buffer| {
+    //         const img, const render, const fence = try self.initSyncObjects();
+    //         try self.frame_command_buffers.append(.{
+    //             .command_buffer = cmd_buffer,
+    //             .image_available_semaphore = img,
+    //             .render_finished_semaphore = render,
+    //             .in_flight_fence = fence
+    //         });
+    //     }
+    //
+    // }
 
-        const buffers = try self.allocator.alloc(vk.CommandBuffer, self.image_count);
-        defer self.allocator.free(buffers);
-        try self.device.allocateCommandBuffers(&alloc_info, buffers.ptr);
+    // fn initSyncObjects(self: *GraphicalContext) !struct {vk.Semaphore, vk.Semaphore, vk.Fence} {
+    //     const semaphore_info = vk.SemaphoreCreateInfo{};
+    //     const fence_info = vk.FenceCreateInfo{
+    //         .flags = .{ .signaled_bit = true }
+    //     };
+    //
+    //     return .{
+    //         try self.device.createSemaphore(&semaphore_info, null),
+    //         try self.device.createSemaphore(&semaphore_info, null),
+    //         try self.device.createFence(&fence_info, null),
+    //     };
+    // }
 
-        self.frame_command_buffers = std.ArrayList(FrameCommandBuffer).init(self.allocator);
-        for (buffers) |cmd_buffer| {
-            const img, const render, const fence = try self.initSyncObjects();
-            try self.frame_command_buffers.append(.{
-                .command_buffer = cmd_buffer,
-                .image_available_semaphore = img,
-                .render_finished_semaphore = render,
-                .in_flight_fence = fence
-            });
-        }
-
-    }
-
-    fn initSyncObjects(self: *GraphicalContext) !struct {vk.Semaphore, vk.Semaphore, vk.Fence} {
-        const semaphore_info = vk.SemaphoreCreateInfo{};
-        const fence_info = vk.FenceCreateInfo{
-            .flags = .{ .signaled_bit = true }
-        };
-
-        return .{
-            try self.device.createSemaphore(&semaphore_info, null),
-            try self.device.createSemaphore(&semaphore_info, null),
-            try self.device.createFence(&fence_info, null),
-        };
-    }
-
-    fn recreateSwapchain(self: *GraphicalContext) !void {
+    fn recreateSwapchain(_: *GraphicalContext) !void {
         print("recreating swapchin............\n", .{});
-        try self.device.deviceWaitIdle();
-
-        for (self.swapchain_framebuffers.items) |framebuffer| {
-            self.device.destroyFramebuffer(framebuffer, null);
-        }
-        self.swapchain_framebuffers.clearAndFree();
-
-        for (self.images_view.items) |image_view| {
-            self.device.destroyImageView(image_view, null);
-        }
-        self.images_view.clearAndFree();
-
-        self.device.destroySwapchainKHR(self.swapchain, null);
-
-        try self.initSwapchain();
+        // try self.device.deviceWaitIdle();
+        //
+        // for (self.swapchain_framebuffers.items) |framebuffer| {
+        //     self.device.destroyFramebuffer(framebuffer, null);
+        // }
+        // self.swapchain_framebuffers.clearAndFree();
+        //
+        // for (self.images_view.items) |image_view| {
+        //     self.device.destroyImageView(image_view, null);
+        // }
+        // self.images_view.clearAndFree();
+        //
+        // self.device.destroySwapchainKHR(self.swapchain, null);
+        // try self.initSwapchain();
     }
 
-    fn recordCommandBuffer(self: *GraphicalContext, command_bufer: vk.CommandBuffer, image_index: u32) !void {
-        try self.device.beginCommandBuffer(command_bufer, &.{});
+    fn recordCommandBuffer(self: *GraphicalContext, swap_image: *const SwapImage) !void {
+        try self.device.beginCommandBuffer(swap_image.command_buffer, &.{});
 
         const render_pass_info = vk.RenderPassBeginInfo{
             .render_pass = self.render_pass,
-            .framebuffer = self.swapchain_framebuffers.items[image_index],
+            .framebuffer = swap_image.framebuffer,
             .render_area = .{
                 .offset = .{ .x = 0.0, .y = 0.0 },
                 .extent = self.swapchain_extent
@@ -653,8 +732,8 @@ pub const GraphicalContext = struct {
             }),
         };
 
-        self.device.cmdBeginRenderPass(command_bufer, &render_pass_info, .@"inline");
-        self.device.cmdBindPipeline(command_bufer, .graphics, self.graphics_pipeline);
+        self.device.cmdBeginRenderPass(swap_image.command_buffer, &render_pass_info, .@"inline");
+        self.device.cmdBindPipeline(swap_image.command_buffer, .graphics, self.graphics_pipeline);
 
         const viewport = vk.Viewport{
             .x = 0.0,
@@ -669,58 +748,61 @@ pub const GraphicalContext = struct {
             .extent = self.swapchain_extent,
         };
 
-        self.device.cmdSetViewport(command_bufer, 0, 1, @ptrCast(&viewport));
-        self.device.cmdSetScissor(command_bufer, 0, 1, @ptrCast(&scissor));
-        self.device.cmdDraw(command_bufer, 3, 1, 0, 0);
+        self.device.cmdSetViewport(swap_image.command_buffer, 0, 1, @ptrCast(&viewport));
+        self.device.cmdSetScissor(swap_image.command_buffer, 0, 1, @ptrCast(&scissor));
+        self.device.cmdDraw(swap_image.command_buffer, 3, 1, 0, 0);
 
-        self.device.cmdEndRenderPass(command_bufer);
-        try self.device.endCommandBuffer(command_bufer);
+        self.device.cmdEndRenderPass(swap_image.command_buffer);
+        try self.device.endCommandBuffer(swap_image.command_buffer);
     }
 
     pub fn drawFrame(self: *GraphicalContext) !void {
-        const cur_frame_command_buffer = self.frame_command_buffers.items[self.current_frame];
+        const swap_image = self.swap_images[self.current_frame];
 
-        const command_buffer = cur_frame_command_buffer.command_buffer;
-        const in_flight_fence = cur_frame_command_buffer.in_flight_fence; 
-        const image_available_semaphore = cur_frame_command_buffer.image_available_semaphore;
-        const render_finished_semaphore = cur_frame_command_buffer.render_finished_semaphore;
+        // print("---------------------------\n", .{});
+        // print("Current frame: {d}\n", .{self.current_frame});
+        // print("Using fence: {?}\n", .{in_flight_fence});
+        // print("Using image semaphore: {?}\n", .{image_available_semaphore});
+        // print("Using render semaphore: {?}\n", .{render_finished_semaphore});
 
-        _ = try self.device.waitForFences(1, @ptrCast(&in_flight_fence), vk.TRUE, std.math.maxInt(u32));
-        try self.device.resetFences(1, @ptrCast(&in_flight_fence));
-            
+        _ = try self.device.waitForFences(1, @ptrCast(&swap_image.in_flight_fence), vk.TRUE, std.math.maxInt(u32));
+
         const acquire_res = try self.device.acquireNextImageKHR(
-            self.swapchain, std.math.maxInt(u32), image_available_semaphore, .null_handle
+            self.swapchain, std.math.maxInt(u32), swap_image.image_available_semaphore, .null_handle
         );
 
-        if (acquire_res.result == .error_out_of_date_khr) {
+        if (acquire_res.result == .error_out_of_date_khr or acquire_res.result == .suboptimal_khr or self.framebuffer_resized) {
+            self.framebuffer_resized = false;
             try self.recreateSwapchain();
             return;
         } else if (acquire_res.result != .success and acquire_res.result != .suboptimal_khr) {
             return error.FailedToAcquireSwapchain;
         }
 
-        try self.device.resetCommandBuffer(command_buffer, .{});
-        try self.recordCommandBuffer(command_buffer, acquire_res.image_index);
-        
+        try self.device.resetFences(1, @ptrCast(&swap_image.in_flight_fence));
+
+        try self.device.resetCommandBuffer(swap_image.command_buffer, .{});
+        try self.recordCommandBuffer(&swap_image);
+
         try self.device.queueSubmit(self.graphics_queue, 1, &[_]vk.SubmitInfo{.{
             .command_buffer_count = 1,
-            .p_command_buffers = @ptrCast(&command_buffer),
+            .p_command_buffers = @ptrCast(&swap_image.command_buffer),
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast(&image_available_semaphore),
+            .p_wait_semaphores = @ptrCast(&swap_image.image_available_semaphore),
             .signal_semaphore_count = 1,
-            .p_signal_semaphores = @ptrCast(&render_finished_semaphore),
+            .p_signal_semaphores = @ptrCast(&swap_image.render_finished_semaphore),
             .p_wait_dst_stage_mask = &[_]vk.PipelineStageFlags{.{.color_attachment_output_bit = true}},
-        }}, in_flight_fence);
+        }}, swap_image.in_flight_fence);
 
         _ = try self.device.queuePresentKHR(self.present_queue, &.{
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast(&render_finished_semaphore),
+            .p_wait_semaphores = @ptrCast(&swap_image.render_finished_semaphore),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast(&self.swapchain),
             .p_image_indices = @ptrCast(&acquire_res.image_index)
         });
 
-        self.current_frame = @rem((self.current_frame + 1), self.image_count);
+        self.current_frame = @rem((self.current_frame + 1), self.max_in_flight_frame);
     }
 
     pub fn deviceWaitIdle(self: *GraphicalContext) !void {
@@ -857,33 +939,16 @@ pub const GraphicalContext = struct {
             self.instance.destroyDebugUtilsMessengerEXT(debug_ext, null);
         }
 
-        for (self.frame_command_buffers.items) |f| {
-            self.device.destroySemaphore(f.image_available_semaphore, null);
-            self.device.destroySemaphore(f.render_finished_semaphore, null);
-            self.device.destroyFence(f.in_flight_fence, null);
+        for (self.swap_images) |swap_image| {
+            swap_image.deinit(self);
         }
 
-        // std.debug.print("image view size: {d}\n", .{self.images_view.items.len});
-        // const image_view_slice: []vk.ImageView = self.images_view.allocatedSlice();
-        // std.debug.print("image view slice size: {d}\n", .{image_view_slice.len});
         self.device.destroyCommandPool(self.command_pool, null);
-        self.frame_command_buffers.deinit();
-
-        for (self.swapchain_framebuffers.items) |framebuffer| {
-            self.device.destroyFramebuffer(framebuffer, null);
-        }
-        self.swapchain_framebuffers.deinit();
-
-        for (self.images_view.items) |image_view| {
-            self.device.destroyImageView(image_view, null);
-        }
+        self.allocator.free(self.swap_images);
 
         self.device.destroyPipeline(self.graphics_pipeline, null);
         self.device.destroyPipelineLayout(self.pipeline_layout, null);
         self.device.destroyRenderPass(self.render_pass, null);
-
-        self.images_view.deinit();
-        self.allocator.free(self.images);
 
         self.device.destroySwapchainKHR(self.swapchain, null);
         self.instance.destroySurfaceKHR(self.surface, null);
